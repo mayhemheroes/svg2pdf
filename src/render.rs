@@ -8,8 +8,8 @@ use pdf_writer::types::{
 use pdf_writer::writers::Shading;
 use pdf_writer::{Content, Filter, Finish, Name, PdfWriter, Rect, Ref, Writer};
 use usvg::{
-    Align, AspectRatio, FillRule, ImageKind, LineCap, LineJoin, Node, NodeExt, NodeKind,
-    Paint, PathSegment, Pattern, Transform, Units, ViewBox, Visibility,
+    Align, AspectRatio, FillRule, ImageKind, LineCap, LineJoin, Node, NodeExt, Paint,
+    PathData, PathSegment, Pattern, Transform, Units, ViewBox, Visibility,
 };
 
 #[cfg(any(feature = "png", feature = "jpeg"))]
@@ -165,8 +165,8 @@ fn render_path_partial(
     content.set_fill_color_space(ColorSpaceOperand::Named(SRGB));
     content.set_stroke_color_space(ColorSpaceOperand::Named(SRGB));
 
-    let stroke_opacity = path.stroke.as_ref().map(|s| s.opacity.value() as f32);
-    let fill_opacity = path.fill.as_ref().map(|f| f.opacity.value() as f32);
+    let stroke_opacity = path.stroke.as_ref().map(|s| s.opacity.get() as f32);
+    let fill_opacity = path.fill.as_ref().map(|f| f.opacity.get() as f32);
 
     // Write a graphics state for stroke and fill opacity.
     if stroke_opacity.unwrap_or(1.0) != 1.0 || fill_opacity.unwrap_or(1.0) != 1.0 {
@@ -178,7 +178,7 @@ fn render_path_partial(
 
     if stroke {
         if let Some(stroke) = &path.stroke {
-            content.set_line_width(ctx.c.px_to_pt(stroke.width.value()));
+            content.set_line_width(ctx.c.px_to_pt(stroke.width.get()));
 
             match stroke.linecap {
                 LineCap::Butt => content.set_line_cap(LineCapStyle::ButtCap),
@@ -194,7 +194,7 @@ fn render_path_partial(
                 LineJoin::Bevel => content.set_line_join(LineJoinStyle::BevelJoin),
             };
 
-            content.set_miter_limit(stroke.miterlimit.value() as f32);
+            content.set_miter_limit(stroke.miterlimit.get() as f32);
 
             if let Some(dasharray) = &stroke.dasharray {
                 content.set_dash_pattern(
@@ -203,32 +203,27 @@ fn render_path_partial(
                 );
             }
 
-            match &stroke.paint {
-                Paint::Color(c) => {
-                    content.set_stroke_color(RgbColor::from(*c).to_array());
-                }
-                Paint::Link(id) => {
-                    let item = ctx.tree.defs_by_id(id).unwrap();
-                    content.set_stroke_color_space(ColorSpaceOperand::Pattern);
-                    let num = ctx.alloc_pattern();
-                    let name = format!("p{}", num);
+            if let Paint::Color(c) = &stroke.paint {
+                content.set_stroke_color(RgbColor::from(*c).to_array());
+            } else {
+                content.set_stroke_color_space(ColorSpaceOperand::Pattern);
+                let num = ctx.alloc_pattern();
+                let name = format!("p{}", num);
 
-                    match *item.borrow() {
-                        NodeKind::RadialGradient(_) | NodeKind::LinearGradient(_) => {
-                            let pattern = stroke_gradient.unwrap();
-
-                            ctx.pending_gradients.push(PendingGradient::from_gradient(
-                                pattern, bbox, num, &ctx.c,
-                            ));
-                        }
-                        NodeKind::Pattern(ref pattern) => {
-                            prep_pattern(pattern, &item, num, bbox, writer, ctx);
-                        }
-                        _ => unreachable!(),
+                match &stroke.paint {
+                    Paint::RadialGradient(_) | Paint::LinearGradient(_) => {
+                        let pattern = stroke_gradient.unwrap();
+                        ctx.pending_gradients.push(PendingGradient::from_gradient(
+                            pattern, bbox, num, &ctx.c,
+                        ));
                     }
-
-                    content.set_stroke_pattern(None, Name(name.as_bytes()));
+                    Paint::Pattern(ref pattern) => {
+                        prep_pattern(pattern, num, bbox, writer, ctx);
+                    }
+                    _ => unreachable!(),
                 }
+
+                content.set_stroke_pattern(None, Name(name.as_bytes()));
             }
         }
     }
@@ -238,23 +233,22 @@ fn render_path_partial(
             Some(Paint::Color(c)) => {
                 content.set_fill_color(RgbColor::from(*c).to_array());
             }
-            Some(Paint::Link(id)) => {
-                let item = ctx.tree.defs_by_id(id).unwrap();
+            Some(other) => {
                 content.set_fill_color_space(ColorSpaceOperand::Pattern);
 
                 let num = ctx.alloc_pattern();
                 let name = format!("p{}", num);
 
-                match *item.borrow() {
-                    NodeKind::RadialGradient(_) | NodeKind::LinearGradient(_) => {
+                match other {
+                    Paint::RadialGradient(_) | Paint::LinearGradient(_) => {
                         let pattern = fill_gradient.unwrap();
 
                         ctx.pending_gradients.push(PendingGradient::from_gradient(
                             pattern, bbox, num, &ctx.c,
                         ));
                     }
-                    NodeKind::Pattern(ref pattern) => {
-                        prep_pattern(pattern, &item, num, bbox, writer, ctx);
+                    Paint::Pattern(ref pattern) => {
+                        prep_pattern(pattern, num, bbox, writer, ctx);
                     }
                     _ => unreachable!(),
                 }
@@ -265,7 +259,7 @@ fn render_path_partial(
         }
     }
 
-    draw_path(&path.data.0, path.transform, content, &ctx.c);
+    draw_path(&path.data, path.transform, content, &ctx.c);
 
     match (
         path.fill.as_ref().map(|f| f.rule),
@@ -315,27 +309,6 @@ fn transform_to_matrix(transform: Transform) -> [f32; 6] {
         transform.e as f32,
         transform.f as f32,
     ]
-}
-
-/// Retrieve the pattern and alpha values for a paint.
-fn get_gradient(paint: Option<&Paint>, ctx: &Context) -> (Option<Gradient>, Option<Ref>) {
-    // Retrieve the fill gradient description struct if the fill is a
-    // gradient.
-    let gradient = if let Some(Paint::Link(id)) = paint {
-        let node = ctx.tree.defs_by_id(id).unwrap();
-        Gradient::from_node(node)
-    } else {
-        None
-    };
-
-    // Get the alpha function for the gradient if there is some.
-    let alpha_func = if let Some(Paint::Link(id)) = paint {
-        ctx.function_map.get(id).and_then(|x| x.1)
-    } else {
-        None
-    };
-
-    (gradient, alpha_func)
 }
 
 /// Write the alpha shading Form XObject using a function. Returns an indirect
@@ -426,7 +399,6 @@ fn start_wrap(
 /// Write a pattern to the file for use for filling or stroking.
 fn prep_pattern(
     pattern: &Pattern,
-    node: &Node,
     num: u32,
     bbox: usvg::Rect,
     writer: &mut PdfWriter,
@@ -472,7 +444,7 @@ fn prep_pattern(
 
     let old = ctx.c.concat_transform(inner_transform);
 
-    let pattern_stream = content_stream(node, writer, ctx);
+    let pattern_stream = content_stream(&pattern.root, writer, ctx);
     ctx.c.set_transform(old);
 
     let pattern_ref = ctx.alloc_ref();
@@ -538,19 +510,22 @@ impl Render for usvg::Group {
         let name = format!("xo{}", num);
         content.save_state();
 
-        apply_clip_path(self.clip_path.as_ref(), content, ctx);
+        if let Some(clip_path) = &self.clip_path {
+            apply_clip_path(clip_path, content, ctx);
+        }
 
-        if let Some(reference) = apply_mask(self.mask.as_ref(), bbox, pdf_bbox, ctx) {
+        if let Some(mask) = self.mask.as_deref() {
+            let reference = apply_mask(mask, bbox, pdf_bbox, ctx);
             let num = ctx.alloc_gs();
             content.set_parameters(Name(format!("gs{}", num).as_bytes()));
             ctx.pending_graphics.push(PendingGS::soft_mask(reference, num));
         }
 
-        if self.opacity.value() != 1.0 {
+        if self.opacity.get() != 1.0 {
             let num = ctx.alloc_gs();
             content.set_parameters(Name(format!("gs{}", num).as_bytes()));
             ctx.pending_graphics
-                .push(PendingGS::fill_opacity(self.opacity.value() as f32, num));
+                .push(PendingGS::fill_opacity(self.opacity.get() as f32, num));
         }
 
         ctx.c.set_transform(old);
@@ -577,12 +552,10 @@ impl Render for usvg::Image {
             let image_ref = ctx.alloc_ref();
 
             #[cfg(any(feature = "png", feature = "jpeg", feature = "gif"))]
-            let set_image_props = |
-                image: &mut ImageXObject,
-                raster_size: &mut Option<(u32, u32)>,
-                decoded: &DynamicImage,
-                grey: bool,
-            | {
+            let set_image_props = |image: &mut ImageXObject,
+                                   raster_size: &mut Option<(u32, u32)>,
+                                   decoded: &DynamicImage,
+                                   grey: bool| {
                 let color = decoded.color();
                 *raster_size = Some((decoded.width(), decoded.height()));
                 image.width(decoded.width() as i32);
@@ -802,13 +775,13 @@ impl Render for usvg::Image {
 /// Draw a path into a content stream. Does close the path but not perform any
 /// drawing operators.
 pub fn draw_path(
-    path_data: &[PathSegment],
+    path_data: &PathData,
     transform: Transform,
     content: &mut Content,
     c: &CoordToPdf,
 ) {
-    for &operation in path_data {
-        match operation {
+    for segment in path_data.segments() {
+        match segment {
             PathSegment::MoveTo { x, y } => {
                 let (x, y) = c.point(transform.apply(x, y));
                 content.move_to(x, y);
@@ -846,18 +819,18 @@ pub(crate) struct Gradient {
 }
 
 impl Gradient {
-    fn from_node(node: Node) -> Option<Self> {
-        match *node.borrow() {
-            NodeKind::LinearGradient(ref lg) => Some(Self {
+    fn from_paint(paint: &Paint) -> Option<Self> {
+        match paint {
+            Paint::LinearGradient(ref lg) => Some(Self {
                 id: lg.id.clone(),
                 shading_type: ShadingType::Axial,
                 coords: [lg.x1, lg.y1, lg.x2, lg.y2, 0.0, 0.0],
                 transform_coords: lg.base.units == usvg::Units::ObjectBoundingBox,
             }),
-            NodeKind::RadialGradient(ref rg) => Some(Self {
+            Paint::RadialGradient(ref rg) => Some(Self {
                 id: rg.id.clone(),
                 shading_type: ShadingType::Radial,
-                coords: [rg.fx, rg.fy, rg.cx, rg.cy, 0.0, rg.r.value()],
+                coords: [rg.fx, rg.fy, rg.cx, rg.cy, 0.0, rg.r.get()],
                 transform_coords: rg.base.units == usvg::Units::ObjectBoundingBox,
             }),
             _ => None,

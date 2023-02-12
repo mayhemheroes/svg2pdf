@@ -36,11 +36,12 @@ managed. Instead, they use PDF's `DeviceRGB` color space.
 */
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use pdf_writer::types::ProcSet;
 use pdf_writer::writers::{ColorSpace, ExponentialFunction, FormXObject, Resources};
 use pdf_writer::{Content, Filter, Finish, Name, PdfWriter, Rect, Ref, TextStr, Writer};
-use usvg::{NodeExt, NodeKind, Opacity, Stop, Tree};
+use usvg::{ClipPath, Mask, NodeKind, Opacity, Stop, Tree};
 
 mod defer;
 mod render;
@@ -142,13 +143,13 @@ struct Context<'a> {
     pending_xobjects: Vec<(u32, Ref)>,
     /// IDs of nodes which need to be written to the root of the document as a
     /// transparency group along with their metadata.
-    pending_groups: HashMap<String, PendingGroup>,
+    pending_groups: Vec<PendingGroup>,
     /// This array stores the lengths of the pending vectors and allows to push
     /// each of their elements onto the closes `Resources` dictionary.
     checkpoints: Vec<[usize; 4]>,
     /// The mask that needs to be applied at the start of a path drawing
     /// operation.
-    initial_mask: Option<String>,
+    initial_mask: Option<Ref>,
     /// Whether the content streas should be compressed.
     compress: bool,
 }
@@ -170,7 +171,7 @@ impl<'a> Context<'a> {
             pending_patterns: vec![],
             pending_graphics: vec![],
             pending_xobjects: vec![],
-            pending_groups: HashMap::new(),
+            pending_groups: vec![],
             checkpoints: vec![],
             initial_mask: None,
             compress,
@@ -261,7 +262,7 @@ pub fn convert_str(src: &str, options: Options) -> Result<Vec<u8>, usvg::Error> 
         usvg_opts.default_size =
             usvg::Size::new(width.max(1.0), height.max(1.0)).unwrap();
     }
-    let tree = Tree::from_str(src, &usvg_opts.to_ref())?;
+    let tree = Tree::from_str(src, &usvg_opts)?;
     Ok(convert_tree(&tree, options))
 }
 
@@ -282,7 +283,7 @@ pub fn convert_tree(tree: &Tree, options: Options) -> Vec<u8> {
     preregister(tree, &mut writer, &mut ctx);
 
     ctx.push();
-    let content = content_stream(&tree.root(), &mut writer, &mut ctx);
+    let content = content_stream(&tree.root, &mut writer, &mut ctx);
 
     write_masks(tree, &mut writer, &mut ctx);
 
@@ -409,7 +410,7 @@ pub fn convert_tree_into(
     preregister(tree, writer, &mut ctx);
 
     ctx.push();
-    let content = content_stream(&tree.root(), writer, &mut ctx);
+    let content = content_stream(&tree.root, writer, &mut ctx);
 
     write_masks(tree, writer, &mut ctx);
 
@@ -436,24 +437,16 @@ pub fn convert_tree_into(
 
 /// Calculates the bounding box and size conversions for an usvg tree.
 fn get_sizings(tree: &Tree, options: &Options) -> (CoordToPdf, Rect) {
-    let native_size = tree.svg_node().size;
+    let native_size = tree.size;
     let viewport = if let Some((width, height)) = options.viewport {
         (width, height)
     } else {
         (native_size.width(), native_size.height())
     };
 
-    let c = CoordToPdf::new(
-        viewport,
-        options.dpi,
-        tree.svg_node().view_box,
-        options.aspect,
-    );
-
-    (
-        c,
-        Rect::new(0.0, 0.0, c.px_to_pt(viewport.0), c.px_to_pt(viewport.1)),
-    )
+    let c = CoordToPdf::new(viewport, options.dpi, tree.view_box, options.aspect);
+    let bounds = Rect::new(0.0, 0.0, c.px_to_pt(viewport.0), c.px_to_pt(viewport.1));
+    (c, bounds)
 }
 
 fn preregister(tree: &Tree, writer: &mut PdfWriter, ctx: &mut Context) {
@@ -479,11 +472,7 @@ fn content_stream<'a>(
     let mut content = Content::new();
     let num = ctx.alloc_gs();
 
-    if let Some(reference) = ctx
-        .initial_mask
-        .as_ref()
-        .and_then(|id| ctx.pending_groups.get(id).map(|g| g.reference))
-    {
+    if let Some(reference) = ctx.initial_mask {
         content.set_parameters(Name(format!("gs{}", num).as_bytes()));
         ctx.pending_graphics.push(PendingGS::soft_mask(reference, num));
     }
@@ -494,7 +483,6 @@ fn content_stream<'a>(
         }
 
         match *element.borrow() {
-            NodeKind::Defs => continue,
             NodeKind::Path(ref path) => {
                 path.render(&element, writer, &mut content, ctx);
             }
@@ -504,85 +492,73 @@ fn content_stream<'a>(
             NodeKind::Image(ref image) => {
                 image.render(&element, writer, &mut content, ctx);
             }
-            _ => {}
+            NodeKind::Text(_) => {}
         }
     }
 
     let res = content.finish();
 
-    if ctx.compress { deflate(&res) } else { res }
+    if ctx.compress {
+        deflate(&res)
+    } else {
+        res
+    }
 }
 
 /// Draw a clipping path into a content stream.
-fn apply_clip_path(path_id: Option<&String>, content: &mut Content, ctx: &mut Context) {
-    if let Some(clip_path) = path_id.and_then(|id| ctx.tree.defs_by_id(id)) {
-        if let NodeKind::ClipPath(ref path) = *clip_path.borrow() {
-            apply_clip_path(path.clip_path.as_ref(), content, ctx);
+fn apply_clip_path(path: &ClipPath, content: &mut Content, ctx: &mut Context) {
+    if let Some(additional) = path.clip_path.as_deref() {
+        apply_clip_path(additional, content, ctx);
+    }
 
-            let old = ctx.c.concat_transform(path.transform);
+    let old = ctx.c.concat_transform(path.transform);
 
-            for child in clip_path.children() {
-                match *child.borrow() {
-                    NodeKind::Path(ref path) => {
-                        draw_path(&path.data.0, path.transform, content, &ctx.c);
-                        content.clip_nonzero();
-                        content.end_path();
-                    }
-                    NodeKind::ClipPath(_) => {}
-                    _ => unreachable!(),
-                }
+    for child in path.root.children() {
+        match *child.borrow() {
+            NodeKind::Path(ref path) => {
+                draw_path(&path.data, path.transform, content, &ctx.c);
+                content.clip_nonzero();
+                content.end_path();
             }
-
-            ctx.c.set_transform(old);
-        } else {
-            unreachable!();
+            _ => unreachable!(),
         }
     }
+
+    ctx.c.set_transform(old);
 }
 
 /// Prepare a mask to be written to the file. This will calculate the metadata
 /// and create a `pending_group`.
 fn apply_mask(
-    mask_id: Option<&String>,
+    mask: &usvg::Mask,
     bbox: usvg::Rect,
     pdf_bbox: Rect,
     ctx: &mut Context,
-) -> Option<Ref> {
-    if let Some(mask_node) = mask_id.and_then(|id| ctx.tree.defs_by_id(id)) {
-        if let NodeKind::Mask(ref mask) = *mask_node.borrow() {
-            let reference = ctx.alloc_ref();
-            let (bbox, matrix) = if mask.content_units == usvg::Units::UserSpaceOnUse {
-                (*ctx.bbox, None)
-            } else {
-                let point = mask_node.transform().apply(mask.rect.x(), mask.rect.y());
-                let (x, y) = ctx.c.point(point);
-                let transform =
-                    [1.0, 0.0, 0.0, 1.0, bbox.x() as f32 + x, bbox.y() as f32 + y];
-                (pdf_bbox, Some(transform))
-            };
-
-            apply_mask(mask.mask.as_ref(), mask.rect, pdf_bbox, ctx);
-
-            let context_transform = ctx.c.get_transform();
-
-            ctx.pending_groups.insert(
-                mask.id.clone(),
-                PendingGroup {
-                    reference,
-                    bbox,
-                    matrix,
-                    transform: context_transform,
-                    initial_mask: mask.mask.clone(),
-                },
-            );
-
-            Some(reference)
-        } else {
-            unreachable!()
-        }
+) -> Ref {
+    let reference = ctx.alloc_ref();
+    let (bbox, matrix) = if mask.content_units == usvg::Units::UserSpaceOnUse {
+        (*ctx.bbox, None)
     } else {
-        None
+        let point = (mask.rect.x(), mask.rect.y());
+        let (x, y) = ctx.c.point(point);
+        let transform = [1.0, 0.0, 0.0, 1.0, bbox.x() as f32 + x, bbox.y() as f32 + y];
+        (pdf_bbox, Some(transform))
+    };
+
+    if let Some(additional) = mask.mask.as_deref() {
+        apply_mask(additional, mask.rect, pdf_bbox, ctx);
     }
+
+    let context_transform = ctx.c.get_transform();
+    ctx.pending_groups.push(PendingGroup {
+        reference,
+        bbox,
+        matrix,
+        transform: context_transform,
+        initial_mask: mask.mask.clone(),
+    });
+
+    reference
 }
 
 /// A color helper function that stores colors with values between 0.0 and 1.0.
@@ -630,7 +606,7 @@ fn register_functions(
     let func_ref = ctx.alloc_ref();
     stops_to_function(writer, func_ref, stops, false);
 
-    let alpha_ref = if stops.iter().any(|stop| stop.opacity.value() < 1.0) {
+    let alpha_ref = if stops.iter().any(|stop| stop.opacity.get() < 1.0) {
         let alpha_ref = ctx.alloc_ref();
         stops_to_function(writer, alpha_ref, &stops, true);
         Some(alpha_ref)
@@ -652,8 +628,8 @@ fn stops_to_function(
 
     let set_alphas =
         |exp: &mut ExponentialFunction, a_alpha: Opacity, b_alpha: Opacity| {
-            exp.c0([a_alpha.value() as f32]);
-            exp.c1([b_alpha.value() as f32]);
+            exp.c0([a_alpha.get() as f32]);
+            exp.c1([b_alpha.get() as f32]);
         };
 
     let set_rgbs =
@@ -689,10 +665,9 @@ fn stops_to_function(
     let mut bounds = Vec::new();
     let mut encode = Vec::with_capacity(2 * (stops.len() - 1));
 
-    let stops = if stops[0].offset.value() != 0.0 {
+    let stops = if stops[0].offset.get() != 0.0 {
         let mut appended = stops[0].clone();
-        appended.offset = usvg::StopOffset::new(0.0);
-
+        appended.offset = usvg::StopOffset::ZERO;
         let mut res = vec![appended];
         res.extend_from_slice(stops);
         res
@@ -703,7 +678,7 @@ fn stops_to_function(
     for window in stops.windows(2) {
         let (a, b) = (window[0], window[1]);
         let (a_color, b_color) = (RgbColor::from(a.color), RgbColor::from(b.color));
-        bounds.push(b.offset.value() as f32);
+        bounds.push(b.offset.get() as f32);
         let mut exp = ExponentialFunction::start(func_array.push());
         exp.domain([0.0, 1.0]);
         exp.range(range.clone());
@@ -784,7 +759,7 @@ mod tests {
             let buf = convert_str(&doc, options).unwrap();
 
             let len = base_name.len();
-            let file_name = format!("{}.pdf", &base_name[0 .. len - 4]);
+            let file_name = format!("{}.pdf", &base_name[0..len - 4]);
 
             std::fs::write(format!("target/{}", file_name), buf).unwrap();
         }

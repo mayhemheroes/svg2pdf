@@ -15,12 +15,12 @@ default = ["png", "jpeg", "gif"]
 png = ["image/png"]
 jpeg = ["image/jpeg"]
 gif = ["image/gif"]
-cli = ["clap", "termcolor", "usvg/text", "fontdb"]
+cli = ["clap", "termcolor", "fontdb"]
 
 [dependencies]
 miniz_oxide = "0.5"
 pdf-writer = "0.6"
-usvg = { version = "0.22", default-features = false }
+usvg = "0.29"
 clap = { version = "3", features = ["derive"], optional = true }
 fontdb = { version = "0.9", optional = true }
 image = { version = "0.24", default-features = false, optional = true }

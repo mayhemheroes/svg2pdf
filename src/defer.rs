@@ -5,11 +5,12 @@
 //! and functions to ultimately populate them to the file.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use pdf_writer::types::{MaskType, ShadingType};
 use pdf_writer::writers::{ExtGraphicsState, Resources, ShadingPattern};
 use pdf_writer::{Finish, Name, PdfWriter, Rect, Ref};
-use usvg::{NodeKind, Transform, Tree};
+use usvg::{Mask, Transform, Tree};
 
 use super::{content_stream, form_xobject, Context, CoordToPdf};
 use crate::render::Gradient;
@@ -125,6 +126,8 @@ impl PendingGS {
 pub struct PendingGroup {
     /// The indirect reference that has been pre-allocated for the Form XObject.
     pub reference: Ref,
+    /// The mask object.
+    pub mask: Rc<Mask>,
     /// The PDF bounding box of the form XObject.
     pub bbox: Rect,
     /// A transformation matrix to allow for a different coordinate system use
@@ -135,7 +138,7 @@ pub struct PendingGroup {
     pub transform: Transform,
     /// An SVG ID to a mask that should be applied at the start of the content
     /// stream.
-    pub initial_mask: Option<String>,
+    pub initial_mask: Option<Ref>,
 }
 
 /// Writes all pending gradients and patterns into a `Resources` dictionary. The
@@ -231,32 +234,27 @@ pub fn write_xobjects(pending_xobjects: &[(u32, Ref)], resources: &mut Resources
 /// Write the content streams of the used masks stored in the context to the
 /// file.
 pub(crate) fn write_masks(tree: &Tree, writer: &mut PdfWriter, ctx: &mut Context) {
-    for (id, gp) in ctx.pending_groups.clone() {
-        let mask_node = tree.defs_by_id(&id).unwrap();
-        let borrowed = mask_node.borrow();
+    for gp in ctx.pending_groups.clone() {
+        ctx.push();
+        ctx.initial_mask = gp.initial_mask;
 
-        if let NodeKind::Mask(_) = *borrowed {
-            ctx.push();
-            ctx.initial_mask = gp.initial_mask;
+        // Get the context of where the pending group was originally in the tree
+        let old = ctx.c.set_transform(gp.transform);
 
-            // Get the context of where the pending group was originally in the tree
-            let old = ctx.c.set_transform(gp.transform);
+        let content = content_stream(&gp.mask.root, writer, ctx);
 
-            let content = content_stream(&mask_node, writer, ctx);
+        let mut group =
+            form_xobject(writer, gp.reference, &content, gp.bbox, ctx.compress, true);
 
-            let mut group =
-                form_xobject(writer, gp.reference, &content, gp.bbox, ctx.compress, true);
-
-            if let Some(matrix) = gp.matrix {
-                group.matrix(matrix);
-            }
-
-            ctx.c.set_transform(old);
-
-            let mut resources = group.resources();
-            ctx.pop(&mut resources);
-            resources.finish();
+        if let Some(matrix) = gp.matrix {
+            group.matrix(matrix);
         }
+
+        ctx.c.set_transform(old);
+
+        let mut resources = group.resources();
+        ctx.pop(&mut resources);
+        resources.finish();
     }
 
     ctx.initial_mask = None;
