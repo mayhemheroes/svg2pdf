@@ -7,11 +7,10 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  CONVERT_STR_MAYHEMFILE: mayhem/convert_str.mayhemfile
 
 jobs:
   build:
-    name: "${{ matrix.os }} shared=${{ matrix.shared }} ${{ matrix.build_type }}"
+    name: '${{ matrix.os }} shared=${{ matrix.shared }} ${{ matrix.build_type }}'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -23,10 +22,12 @@ jobs:
             triplet: x64-linux
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
+        with:
+          submodules: recursive
 
       - name: Log in to the Container registry
-        uses: docker/login-action@f054a8b539a109f9f41c372932f1ae047eff08c9
+        uses: docker/login-action@v2.1.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -34,27 +35,41 @@ jobs:
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@98669ae865ea3cffbcbaa878cf57c20bbf1c6c38
+        uses: docker/metadata-action@v4.1.1
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
+        uses: docker/build-push-action@v3.2.0
         with:
           context: .
-          file: mayhem/mayhem.Dockerfile
           push: true
+          file: mayhem/mayhem.Dockerfile
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      - name: Start analysis for convert_str
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+
+  mayhem:
+    needs: build
+    name: 'fuzz ${{ matrix.mayhemfile }}'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        convert_str_mayhemfile:
+          - mayhem/convert_str.mayhemfile
+
+    steps:
+      - uses: actions/checkout@v3
+
+
+      - name: Start analysis for ${{ matrix.convert_str_mayhemfile }}
         uses: ForAllSecure/mcode-action@v1
         with:
           mayhem-token: ${{ secrets.MAYHEM_TOKEN }}
-          args: 
-            --image ${{ steps.meta.outputs.tags }} 
-            --file ${{ env.CONVERT_STR_MAYHEMFILE }}
-            --duration 1800
+          args: --image ${{ needs.build.outputs.image }} --file ${{ matrix.convert_str_mayhemfile }} --duration 600
           sarif-output: sarif
 
       - name: Upload SARIF file(s)

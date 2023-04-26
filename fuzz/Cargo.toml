@@ -9,10 +9,8 @@ edition = "2018"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4"
-
-[dependencies.svg2pdf]
-path = ".."
+svg2pdf = { path = ".." }
+libfuzzer-sys = "0.4.0"
 
 [workspace]
 members = ["."]
