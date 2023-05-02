@@ -58,18 +58,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        convert_str_mayhemfile:
+        mayhemfile:
           - mayhem/convert_str.mayhemfile
 
     steps:
       - uses: actions/checkout@v3
 
-
-      - name: Start analysis for ${{ matrix.convert_str_mayhemfile }}
+      - name: Start analysis for ${{ matrix.mayhemfile }}
         uses: ForAllSecure/mcode-action@v1
         with:
           mayhem-token: ${{ secrets.MAYHEM_TOKEN }}
-          args: --image ${{ needs.build.outputs.image }} --file ${{ matrix.convert_str_mayhemfile }} --duration 600
+          args: --image ${{ needs.build.outputs.image }} --file ${{ matrix.mayhemfile }} --duration 600
           sarif-output: sarif
 
       - name: Upload SARIF file(s)
