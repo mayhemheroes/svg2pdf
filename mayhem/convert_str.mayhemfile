@@ -1,0 +1,7 @@
+project: svg2pdf
+target: convert_str
+duration: 600
+cmds:
+    - cmd: /fuzzers/fuzz_convert_str
+testsuite:
+    - file:///corpus/svgs
