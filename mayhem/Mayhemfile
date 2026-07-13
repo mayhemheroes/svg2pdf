@@ -1,0 +1,14 @@
+# Ported from the pre-two-branch integration (archive/original-main:
+# mayhem/convert_str.mayhemfile). Same target name (convert_str); the harness
+# was updated to the current upstream API (usvg::Tree::from_str + to_pdf).
+project: svg2pdf
+target: convert_str
+
+cmds:
+  # libFuzzer binary; Mayhem feeds inputs on stdin (no @@ = stdin input).
+  - cmd: /mayhem/convert_str
+    libfuzzer: true
+
+testsuite:
+  - https://$MAYHEM_DOMAIN/$MAYHEM_PROJECT/$MAYHEM_TARGET/testsuite.tar
+  - file://mayhem/convert_str/testsuite

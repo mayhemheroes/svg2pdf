@@ -1,0 +1,27 @@
+[package]
+name = "svg2pdf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.svg2pdf]
+path = "../.."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "convert_str"
+path = "fuzz_targets/convert_str.rs"
+test = false
+doc = false
+
+[profile.release]
+debug = true
